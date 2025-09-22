@@ -31,13 +31,13 @@ fn main() {
     // 4) Calculate the animal feed production
     // 5) Pro-rata consume all 4 feedstocks in feed-output-adjusted at-ratio consumption rates until feed ratio == pro-rata reduced foodstock ratio
     //  Note that step 5 only kicks in if the animal feed production ratio is less than the feedstock ratio calculated in step 3).
-    //  That is, if we already have excess feed from the 3 non-constrained crops, there's no need to make feed from the 4th.
+    //  That is, if we already have excess feed from the 3 crops with excess production, there's no need to make feed from the 4th.
     
     // Create configuration from user inputs
     let config = CropConfig::new(&number_of_farms_needed_for_each_crop);
     
     // Test optimization for 3, 4, and 5 farms
-    for n_farms in [3, 4, 5] {
+    for n_farms in 3..=10 {
         println!("\n{:=<80}", "");
         println!("OPTIMIZING FOR {} FARMS", n_farms);
         println!("{:=<80}", "");
@@ -45,7 +45,7 @@ fn main() {
         let solution = optimize_farm_allocation(n_farms, &config);
         
         println!("\nBest solution found:");
-        println!("  Effective production: {:.4}", solution.effective_production);
+        println!("  Effective production: {:.4} {:.4}%", solution.effective_production, solution.effective_production / n_farms as f32);
         
         let total_production = calculate_total_production(&solution.farm_rotation_indices, &config);
         let bottleneck_crop = solution.bottleneck_crop_index(&config);

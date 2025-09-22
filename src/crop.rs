@@ -198,8 +198,7 @@ fn calculate_effective_production(total_production: &[f32; NUM_CROPS], config: &
 // Now handles 16 crops using 2 AVX words (8 crops each) and returns only the minimum effective production
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[cfg(target_arch = "x86_64")]
-unsafe fn calculate_effective_production_avx_inner(rotation_indices: &[usize], config: &CropConfig) -> f32 {
+unsafe fn accumulate_total_production_avx(rotation_indices: &[usize], config: &CropConfig) -> (__m256, __m256) {
     // Initialize 256-bit vectors for the 16 crops (2 vectors of 8 crops each)
     let mut total_production_vec1 = _mm256_setzero_ps(); // Crops 0-7
     let mut total_production_vec2 = _mm256_setzero_ps(); // Crops 8-15
@@ -217,6 +216,28 @@ unsafe fn calculate_effective_production_avx_inner(rotation_indices: &[usize], c
         total_production_vec2 = _mm256_add_ps(total_production_vec2, production_vec2);
     }
     
+    (total_production_vec1, total_production_vec2)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_single_farm_rotation(total_production_vec1: __m256, total_production_vec2: __m256, rotation_idx: usize, config: &CropConfig) -> (__m256, __m256) {
+    let rotation = &config.all_rotations[rotation_idx];
+    
+    // Load first 8 crop productions into first 256-bit vector
+    let production_vec1 = _mm256_loadu_ps(rotation.production_percentages.as_ptr());
+    let new_total_production_vec1 = _mm256_add_ps(total_production_vec1, production_vec1);
+    
+    // Load next 8 crop productions into second 256-bit vector
+    let production_vec2 = _mm256_loadu_ps(rotation.production_percentages.as_ptr().add(8));
+    let new_total_production_vec2 = _mm256_add_ps(total_production_vec2, production_vec2);
+    
+    (new_total_production_vec1, new_total_production_vec2)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn calculate_min_effective_from_vectors(total_production_vec1: __m256, total_production_vec2: __m256, config: &CropConfig) -> f32 {
     // Load crop ratio reciprocals for vectorized multiplication (faster than division)
     let crop_ratios_reciprocal_vec1 = _mm256_loadu_ps(config.crop_ratios_reciprocal.as_ptr());
     let crop_ratios_reciprocal_vec2 = _mm256_loadu_ps(config.crop_ratios_reciprocal.as_ptr().add(8));
@@ -251,6 +272,13 @@ unsafe fn calculate_effective_production_avx_inner(rotation_indices: &[usize], c
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn calculate_effective_production_avx_inner(rotation_indices: &[usize], config: &CropConfig) -> f32 {
+    let (total_production_vec1, total_production_vec2) = accumulate_total_production_avx(rotation_indices, config);
+    calculate_min_effective_from_vectors(total_production_vec1, total_production_vec2, config)
+}
+
+#[cfg(target_arch = "x86_64")]
 pub fn calculate_effective_production_avx(rotation_indices: &[usize], config: &CropConfig) -> f32 {
     unsafe { calculate_effective_production_avx_inner(rotation_indices, config) }
 }
@@ -279,15 +307,36 @@ fn exhaustive_search_3_farms(config: &CropConfig) -> Solution {
             };
             let mut combinations_tested = 0;
             
+            // Precompute total for first farm
+            #[cfg(target_arch = "x86_64")]
+            let (total_i_vec1, total_i_vec2) = unsafe {
+                add_single_farm_rotation(_mm256_setzero_ps(), _mm256_setzero_ps(), i, config)
+            };
+            
             for j in i..n_rotations {
+                // Precompute total for first two farms
+                #[cfg(target_arch = "x86_64")]
+                let (total_ij_vec1, total_ij_vec2) = unsafe {
+                    add_single_farm_rotation(total_i_vec1, total_i_vec2, j, config)
+                };
+                
                 for k in j..n_rotations {
-                    let farm_rotation_indices = vec![i, j, k];
+                    // Add third farm and calculate effective production
+                    #[cfg(target_arch = "x86_64")]
+                    let effective_production = unsafe {
+                        let (total_vec1, total_vec2) = add_single_farm_rotation(total_ij_vec1, total_ij_vec2, k, config);
+                        calculate_min_effective_from_vectors(total_vec1, total_vec2, config)
+                    };
                     
-                    let effective_production = calculate_effective_production_avx(&farm_rotation_indices, config);
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let effective_production = {
+                        let farm_rotation_indices = vec![i, j, k];
+                        calculate_effective_production_avx(&farm_rotation_indices, config)
+                    };
                     
                     if effective_production > local_best.effective_production {
                         local_best = Solution {
-                            farm_rotation_indices,
+                            farm_rotation_indices: vec![i, j, k],
                             effective_production,
                         };
                     }
@@ -340,16 +389,43 @@ fn exhaustive_search_4_farms(config: &CropConfig) -> Solution {
             };
             let mut combinations_tested = 0;
             
+            // Precompute total for first farm
+            #[cfg(target_arch = "x86_64")]
+            let (total_i_vec1, total_i_vec2) = unsafe {
+                add_single_farm_rotation(_mm256_setzero_ps(), _mm256_setzero_ps(), i, config)
+            };
+            
             for j in i..n_rotations {
+                // Precompute total for first two farms
+                #[cfg(target_arch = "x86_64")]
+                let (total_ij_vec1, total_ij_vec2) = unsafe {
+                    add_single_farm_rotation(total_i_vec1, total_i_vec2, j, config)
+                };
+                
                 for k in j..n_rotations {
+                    // Precompute total for first three farms
+                    #[cfg(target_arch = "x86_64")]
+                    let (total_ijk_vec1, total_ijk_vec2) = unsafe {
+                        add_single_farm_rotation(total_ij_vec1, total_ij_vec2, k, config)
+                    };
+                    
                     for l in k..n_rotations {
-                        let farm_rotation_indices = vec![i, j, k, l];
+                        // Add fourth farm and calculate effective production
+                        #[cfg(target_arch = "x86_64")]
+                        let effective_production = unsafe {
+                            let (total_vec1, total_vec2) = add_single_farm_rotation(total_ijk_vec1, total_ijk_vec2, l, config);
+                            calculate_min_effective_from_vectors(total_vec1, total_vec2, config)
+                        };
                         
-                        let effective_production = calculate_effective_production_avx(&farm_rotation_indices, config);
+                        #[cfg(not(target_arch = "x86_64"))]
+                        let effective_production = {
+                            let farm_rotation_indices = vec![i, j, k, l];
+                            calculate_effective_production_avx(&farm_rotation_indices, config)
+                        };
                         
                         if effective_production > local_best.effective_production {
                             local_best = Solution {
-                                farm_rotation_indices,
+                                farm_rotation_indices: vec![i, j, k, l],
                                 effective_production,
                             };
                         }
@@ -387,6 +463,7 @@ fn exhaustive_search_4_farms(config: &CropConfig) -> Solution {
 }
 
 // Exhaustive search for 5 farms with multithreading
+#[allow(dead_code)]
 fn exhaustive_search_5_farms(config: &CropConfig) -> Solution {
     let n_rotations = config.all_rotations.len();
     let start_time = Instant::now();
@@ -494,9 +571,9 @@ fn random_search(n_farms: u32, config: &CropConfig) -> Solution {
                 if optimized_solution.effective_production > thread_best.effective_production {
                     thread_best = optimized_solution;
                 }
-                
-                // Print progress every 12,500 samples per thread (50k total across all threads)
-                if (sample + 1) % 12_500 == 0 {
+
+                // Print progress every 500_000 samples per thread
+                if (sample + 1) % 500_000 == 0 {
                     let total_completed = thread_id * samples_per_thread + sample + 1;
                     println!("    Thread {} progress: {}/{} samples, thread best: {:.4}, total progress: ~{}/{}", 
                              thread_id, sample + 1, thread_samples, thread_best.effective_production, total_completed, samples);
@@ -542,36 +619,56 @@ fn hill_climb_solution(mut farm_rotation_indices: Vec<usize>, config: &CropConfi
         
         // Try swapping each farm's rotation
         for farm_idx in 0..n_farms {
-            let original_rotation = farm_rotation_indices[farm_idx];
+            // Swap the farm to be changed to the front for efficient computation
+            farm_rotation_indices.swap(0, farm_idx);
+            
+            let original_rotation = farm_rotation_indices[0];
             let mut best_swap_rotation = original_rotation;
             let mut best_swap_production = current_effective_production;
             
+            // Precompute total production for all farms except the one being changed
+            #[cfg(target_arch = "x86_64")]
+            let (base_total_vec1, base_total_vec2) = if farm_rotation_indices.len() > 1 {
+                unsafe { accumulate_total_production_avx(&farm_rotation_indices[1..], config) }
+            } else {
+                unsafe { (_mm256_setzero_ps(), _mm256_setzero_ps()) }
+            };
+            
             // Test all possible rotations for this farm
             for new_rotation in 0..n_rotations {
-                if new_rotation != original_rotation {
-                    // Temporarily swap the rotation
-                    farm_rotation_indices[farm_idx] = new_rotation;
-                    
-                    // Calculate new effective production
-                    let new_effective_production = calculate_effective_production_avx(&farm_rotation_indices, config);
-                    
-                    // Check if this is better
-                    if new_effective_production > best_swap_production {
-                        best_swap_rotation = new_rotation;
-                        best_swap_production = new_effective_production;
-                    }
+                #[cfg(target_arch = "x86_64")]
+                let new_effective_production = unsafe {
+                    let (total_vec1, total_vec2) = add_single_farm_rotation(base_total_vec1, base_total_vec2, new_rotation, config);
+                    calculate_min_effective_from_vectors(total_vec1, total_vec2, config)
+                };
+                
+                #[cfg(not(target_arch = "x86_64"))]
+                let new_effective_production = {
+                    farm_rotation_indices[0] = new_rotation;
+                    let result = calculate_effective_production_avx(&farm_rotation_indices, config);
+                    farm_rotation_indices[0] = original_rotation; // Restore for next iteration
+                    result
+                };
+                
+                // Check if this is better
+                if new_effective_production > best_swap_production {
+                    best_swap_rotation = new_rotation;
+                    best_swap_production = new_effective_production;
                 }
             }
             
             // Apply the best swap if it improves the solution
             if best_swap_production > current_effective_production {
-                farm_rotation_indices[farm_idx] = best_swap_rotation;
+                farm_rotation_indices[0] = best_swap_rotation;
                 current_effective_production = best_swap_production;
                 improved = true;
             } else {
                 // Restore original rotation if no improvement found
-                farm_rotation_indices[farm_idx] = original_rotation;
+                farm_rotation_indices[0] = original_rotation;
             }
+            
+            // Swap back to original position
+            farm_rotation_indices.swap(0, farm_idx);
         }
         
         // Prevent infinite loops (shouldn't happen but safety check)
@@ -595,7 +692,7 @@ pub fn optimize_farm_allocation(n_farms: u32, config: &CropConfig) -> Solution {
              config.all_rotations.len(), required_crops);
     
     // If we have fewer farms than required crops, warn but still try
-    if n_farms < 4 * required_crops as u32 {
+    if n_farms * 4 < required_crops as u32 {
         println!("Warning: {} farms may be insufficient to optimally cover all {} required crops", 
                  n_farms, required_crops);
     }
@@ -604,7 +701,7 @@ pub fn optimize_farm_allocation(n_farms: u32, config: &CropConfig) -> Solution {
     match n_farms {
         3 => exhaustive_search_3_farms(config),
         4 => exhaustive_search_4_farms(config),
-        5 => exhaustive_search_5_farms(config),
+        // 5 => exhaustive_search_5_farms(config), // Too expensive to run by default
         _ => random_search(n_farms, config),
     }
 }
